@@ -29,6 +29,7 @@ fn install_script_installs_phase_14_paths() {
         "/etc/nitrosense",
         "fc-cache -f",
         "cargo build --release --manifest-path \"${repo_dir}/Cargo.toml\"",
+        "warning: RGB keyboard interface not detected.",
     ] {
         assert!(
             contents.contains(expected),
@@ -62,10 +63,21 @@ fn install_script_never_builds_release_binary_as_root() {
 }
 
 #[test]
-fn pkexec_wrapper_invokes_policy_target_directly() {
+fn pkexec_wrapper_preserves_gui_session_environment() {
     let contents = fs::read_to_string(Path::new(ROOT).join("install.sh")).unwrap();
-    assert!(contents.contains("pkexec /usr/bin/nitrosense \"$@\""));
-    assert!(!contents.contains("pkexec env"));
+    assert!(contents.contains("pkexec env"));
+    for key in [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ] {
+        assert!(
+            contents.contains(key),
+            "nitro-sense wrapper should preserve {key}"
+        );
+    }
 }
 
 #[test]

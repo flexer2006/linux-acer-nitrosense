@@ -4,6 +4,7 @@
 use egui::Ui;
 
 use crate::config::model::RgbConfig;
+use crate::hardware::rgb;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct KeyboardActions {
@@ -23,7 +24,7 @@ pub fn render(ui: &mut Ui, editor: &mut RgbConfig, rgb_available: bool) -> Keybo
     ui.separator();
 
     if !rgb_available {
-        ui.label("RGB keyboard not detected on this system.");
+        ui.label(rgb::unavailable_reason());
         return actions;
     }
 
@@ -249,6 +250,10 @@ mod tests {
             captured,
             KeyboardActions::default(),
             "unavailable RGB device must not register any action clicks"
+        );
+        assert!(
+            !rgb::unavailable_reason().is_empty(),
+            "unavailable panel should have a setup hint"
         );
     }
 

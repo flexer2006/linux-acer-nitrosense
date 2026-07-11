@@ -5,7 +5,7 @@ use std::io;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NitroError {
-    #[error("EC open failed: {0}")]
+    #[error("EC open failed: {0}. Ensure debugfs is mounted and ec_sys is loaded with write_support=y (e.g., sudo modprobe ec_sys write_support=y).")]
     EcOpen(#[source] io::Error),
 
     #[error("EC refresh failed: {0}")]

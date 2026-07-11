@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use anyhow::Context;
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{error, info, warn};
@@ -20,6 +21,7 @@ use nitrosense::config::manager::ConfigManager;
 use nitrosense::config::model::RgbConfig;
 use nitrosense::error::NitroError;
 use nitrosense::ffi::RawEcDevice;
+use nitrosense::gui_session;
 use nitrosense::hardware::ec::{Ec, EcDevice};
 use nitrosense::hardware::platform::{
     CpuVendor, RegisterMap, detect_cpu_vendor, detect_model, register_map_for_model,
@@ -44,13 +46,6 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 const CAP_SYS_RAWIO: u32 = 17;
 const CAP_SYS_ADMIN: u32 = 21;
-const GUI_ENV_KEYS: &[&str] = &[
-    "DISPLAY",
-    "WAYLAND_DISPLAY",
-    "XAUTHORITY",
-    "XDG_RUNTIME_DIR",
-    "DBUS_SESSION_BUS_ADDRESS",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct CliOptions {
@@ -90,7 +85,7 @@ struct WorkerHandles {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let startup_begin = std::time::Instant::now();
 
     let cli = CliOptions::parse();
@@ -112,8 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = detect_model()?;
     info!("Detected model: {}", model);
 
-    let register_map =
-        register_map_for_model(&model).ok_or_else(|| format!("Unsupported model: {}", model))?;
+    let register_map = register_map_for_model(&model)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported model: {}", model))?;
     let cpu_vendor = detect_cpu_vendor();
     info!("Detected CPU vendor: {:?}", cpu_vendor);
 
@@ -138,7 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ec = Arc::new(Mutex::new(Ec::new(device, register_map)));
     let initial_snapshot = {
         let mut guard = ec.lock().await;
-        guard.open()?;
+        guard.open().context(
+            "EC open failed: ensure debugfs is mounted and ec_sys is loaded with write_support=y \
+             (e.g., sudo modprobe ec_sys write_support=y). If the kernel was recently upgraded, reboot."
+        )?;
         guard.refresh()?;
         apply_config_to_ec(&mut guard, &nitro_config)?;
 
@@ -148,7 +146,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warn!("Failed to apply startup RGB config: {}", err);
             }
         } else {
-            info!("RGB devices unavailable; skipping startup apply");
+            let reason = rgb::unavailable_reason();
+            if reason.is_empty() {
+                info!("RGB devices unavailable; skipping startup apply");
+            } else {
+                info!("RGB devices unavailable; skipping startup apply ({reason})");
+            }
         }
 
         guard.snapshot()
@@ -245,6 +248,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         startup_elapsed.as_secs_f64() * 1000.0
     );
 
+    if !gui_session::ready() && gui_session::ensure_from_invoking_user() {
+        info!("Restored GUI session environment from invoking user");
+    }
+
+    if !gui_session::ready() {
+        return Err(anyhow::anyhow!(
+            "Cannot connect to a display server. On Wayland compositors such as Hyprland, \
+             launch NitroSense via `nitro-sense` from your desktop session instead of \
+             `sudo nitrosense`, or export WAYLAND_DISPLAY and XDG_RUNTIME_DIR first."
+        ));
+    }
+
     let app = NitroSenseApp::new(NitroSenseAppInit {
         state: Arc::clone(&app_state),
         telemetry_rx,
@@ -271,7 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Linux NitroSense",
         native_options,
         Box::new(|_cc| Ok(Box::new(app))),
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GUI error: {e}"))?;
 
     shutdown_application(
         &app_state,
@@ -485,10 +501,8 @@ fn relaunch_with_pkexec() -> std::io::Result<()> {
     let mut command = ProcessCommand::new("pkexec");
     command.arg("env");
 
-    for key in GUI_ENV_KEYS {
-        if let Ok(value) = std::env::var(key) {
-            command.arg(format!("{key}={value}"));
-        }
+    for assignment in gui_session::env_assignments() {
+        command.arg(assignment);
     }
 
     command.arg(exe);

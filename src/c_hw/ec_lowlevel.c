@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/statfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -51,6 +52,21 @@ void ec_set_ops(const struct ec_ops *ops) {
 static const char EC_SYS_PATH[]  = "/sys/kernel/debug/ec/ec0/io";
 static const char EC_DEV_PATH[]  = "/dev/ec";
 
+/* debugfs magic number (DEBUGFS_MAGIC) */
+#define NITRO_DEBUGFS_MAGIC 0x6462672f
+
+/* Ensure debugfs is mounted at /sys/kernel/debug. The ec_sys interface is
+   exposed through debugfs, so without it /sys/kernel/debug/ec/ec0/io will
+   never appear even when the module is loaded. */
+static int ec_ensure_debugfs(void) {
+    struct statfs st;
+    if (statfs("/sys/kernel/debug", &st) == 0 &&
+        (unsigned long)st.f_type == NITRO_DEBUGFS_MAGIC) {
+        return 0;
+    }
+    return nitro_hw_ops.system("mount -t debugfs none /sys/kernel/debug 2>/dev/null");
+}
+
 /* ---- High-resolution timing for EC write latency tracing ---- */
 
 static inline uint64_t nanos_now(void) {
@@ -79,7 +95,9 @@ int ec_open(struct ec_handle *out) {
     memset(out, 0, sizeof(*out));
     out->fd = -1;
 
-    /* Try ec_sys first */
+    /* Try ec_sys first. The ec_sys interface is exposed through debugfs, so
+       make sure debugfs is mounted before attempting the open or modprobe. */
+    (void)ec_ensure_debugfs();
     (void)nitro_hw_ops.system("modprobe -r ec_sys 2>/dev/null");
     (void)nitro_hw_ops.system("modprobe ec_sys write_support=y 2>/dev/null");
 
@@ -89,6 +107,7 @@ int ec_open(struct ec_handle *out) {
         out->uses_ec_sys = true;
         return 0;
     }
+    int ec_sys_errno = errno;
 
     /* Fallback to acpi_ec */
     (void)nitro_hw_ops.system("modprobe acpi_ec 2>/dev/null");
@@ -100,6 +119,11 @@ int ec_open(struct ec_handle *out) {
         return 0;
     }
 
+    /* Preserve the most informative error: EACCES (missing write_support)
+       is more actionable than ENOENT (path simply missing). */
+    if (ec_sys_errno == EACCES || errno == EACCES) {
+        return -EACCES;
+    }
     return -errno;
 }
 

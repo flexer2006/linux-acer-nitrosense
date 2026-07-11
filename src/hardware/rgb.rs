@@ -1,12 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2024-2026 NitroSense Contributors
 
+use std::path::{Path, PathBuf};
+
 use crate::error::NitroError;
 
 pub const PAYLOAD_SIZE: usize = 16;
 pub const CHARACTER_DEVICE: &str = "/dev/acer-gkbbl-0";
 pub const PAYLOAD_SIZE_STATIC: usize = 4;
 pub const CHARACTER_DEVICE_STATIC: &str = "/dev/acer-gkbbl-static-0";
+const LINUWU_RGB_SYSFS_BASE: &str = "/sys/devices/platform/acer-wmi/four_zoned_kb";
+const WMI_GAMING_RGB_GUID: &str = "7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RgbBackend {
+    None,
+    /// `/dev/acer-gkbbl-*` from acer-predator-turbo-and-rgb-keyboard-linux-module.
+    LegacyCharacterDevice,
+    /// `four_zoned_kb/*` sysfs from Linuwu-Sense.
+    LinuwuSysfs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuwuPaths {
+    four_zone_mode: PathBuf,
+    per_zone_mode: PathBuf,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RgbCommand {
@@ -34,14 +53,107 @@ impl RgbDeviceWriter for FsRgbDeviceWriter {
 }
 
 pub fn is_available() -> bool {
-    rgb_devices_available_at(
-        std::path::Path::new(CHARACTER_DEVICE),
-        std::path::Path::new(CHARACTER_DEVICE_STATIC),
-    )
+    !matches!(detect_backend(), RgbBackend::None)
 }
 
-pub fn rgb_devices_available_at(main: &std::path::Path, static_device: &std::path::Path) -> bool {
+pub fn backend() -> RgbBackend {
+    detect_backend()
+}
+
+pub fn unavailable_reason() -> String {
+    match detect_backend() {
+        RgbBackend::LegacyCharacterDevice | RgbBackend::LinuwuSysfs => {
+            return String::new();
+        }
+        RgbBackend::None => {}
+    }
+
+    if linuwu_module_loaded() {
+        if wmi_gaming_rgb_present() {
+            return "linuwu_sense is loaded but this laptop model is not enabled for RGB in \
+                    that driver yet. For Nitro AN515-4x, install \
+                    acer-predator-turbo-and-rgb-keyboard-linux-module (unload linuwu_sense \
+                    first), or wait for four_zoned_kb support for your model in Linuwu-Sense."
+                .to_string();
+        }
+
+        return "linuwu_sense is loaded but the four_zoned_kb RGB interface is missing.".to_string();
+    }
+
+    if wmi_gaming_rgb_present() {
+        return "RGB WMI interface detected. Install either \
+                acer-predator-turbo-and-rgb-keyboard-linux-module \
+                (creates /dev/acer-gkbbl-*) or Linuwu-Sense with four_zoned_kb support."
+            .to_string();
+    }
+
+    "RGB keyboard interface not detected on this system.".to_string()
+}
+
+pub fn rgb_devices_available_at(main: &Path, static_device: &Path) -> bool {
     main.exists() && static_device.exists()
+}
+
+fn detect_backend() -> RgbBackend {
+    compute_backend()
+}
+
+fn compute_backend() -> RgbBackend {
+    if linuwu_paths().is_some() {
+        RgbBackend::LinuwuSysfs
+    } else if rgb_devices_available_at(
+        Path::new(CHARACTER_DEVICE),
+        Path::new(CHARACTER_DEVICE_STATIC),
+    ) {
+        RgbBackend::LegacyCharacterDevice
+    } else {
+        RgbBackend::None
+    }
+}
+
+fn linuwu_paths() -> Option<LinuwuPaths> {
+    discover_linuwu_paths()
+}
+
+fn discover_linuwu_paths() -> Option<LinuwuPaths> {
+    let base = linuwu_sysfs_base();
+    let four_zone_mode = base.join("four_zone_mode");
+    let per_zone_mode = base.join("per_zone_mode");
+    if four_zone_mode.exists() && per_zone_mode.exists() {
+        Some(LinuwuPaths {
+            four_zone_mode,
+            per_zone_mode,
+        })
+    } else {
+        None
+    }
+}
+
+fn linuwu_sysfs_base() -> PathBuf {
+    #[cfg(test)]
+    if let Ok(base) = std::env::var("NITROSENSE_TEST_LINUWU_RGB_BASE") {
+        return PathBuf::from(base);
+    }
+
+    PathBuf::from(LINUWU_RGB_SYSFS_BASE)
+}
+
+fn linuwu_module_loaded() -> bool {
+    Path::new("/sys/module/linuwu_sense").exists()
+}
+
+fn wmi_gaming_rgb_present() -> bool {
+    std::fs::read_dir("/sys/bus/wmi/devices")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(WMI_GAMING_RGB_GUID)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -74,6 +186,10 @@ pub fn apply_rgb_command(
     command: RgbCommand,
 ) -> Result<(), NitroError> {
     validate_rgb_command(command)?;
+    if let Some(paths) = linuwu_paths() {
+        return apply_linuwu_command(&paths, command);
+    }
+
     if command.mode == 0 {
         set_static_mode(
             writer,
@@ -85,6 +201,56 @@ pub fn apply_rgb_command(
     } else {
         set_dynamic_mode(writer, command)
     }
+}
+
+fn apply_linuwu_command(paths: &LinuwuPaths, command: RgbCommand) -> Result<(), NitroError> {
+    if command.mode == 0 {
+        let payload = format_linuwu_per_zone(command);
+        write_linuwu_sysfs(&paths.per_zone_mode, payload)
+    } else {
+        let payload = format_linuwu_four_zone(command);
+        write_linuwu_sysfs(&paths.four_zone_mode, payload)
+    }
+}
+
+fn write_linuwu_sysfs(path: &Path, payload: String) -> Result<(), NitroError> {
+    std::fs::write(path, payload.as_bytes())
+        .map_err(|_| NitroError::RgbDevice(path.display().to_string()))
+}
+
+fn format_linuwu_four_zone(command: RgbCommand) -> String {
+    format!(
+        "{},{},{},{},{},{},{}",
+        command.mode,
+        command.speed,
+        command.brightness,
+        command.direction,
+        command.red,
+        command.green,
+        command.blue
+    )
+}
+
+fn format_linuwu_per_zone(command: RgbCommand) -> String {
+    let color = format!("{:02x}{:02x}{:02x}", command.red, command.green, command.blue);
+    let zones = zone_colors(command.zone, &color);
+    format!(
+        "{},{},{},{},{}",
+        zones[0], zones[1], zones[2], zones[3], command.brightness
+    )
+}
+
+fn zone_colors(zone: u8, color: &str) -> [String; 4] {
+    let off = "000000".to_string();
+    if zone == 0 {
+        return std::array::from_fn(|_| color.to_string());
+    }
+
+    let mut zones = [off.clone(), off.clone(), off.clone(), off.clone()];
+    if (1..=4).contains(&zone) {
+        zones[zone as usize - 1] = color.to_string();
+    }
+    zones
 }
 
 fn validate_rgb_command(command: RgbCommand) -> Result<(), NitroError> {
@@ -508,5 +674,74 @@ mod tests {
         let b = a;
         let c = a;
         assert_eq!(b, c, "Copy + Clone must agree");
+    }
+
+    #[test]
+    fn format_linuwu_four_zone_matches_csv_protocol() {
+        let payload = format_linuwu_four_zone(command(3));
+        assert_eq!(payload, "3,5,80,1,10,20,30");
+    }
+
+    #[test]
+    fn format_linuwu_per_zone_all_zones_repeat_color() {
+        let mut cmd = command(0);
+        cmd.zone = 0;
+        cmd.red = 0x42;
+        cmd.green = 0x87;
+        cmd.blue = 0xf5;
+        cmd.brightness = 100;
+
+        assert_eq!(
+            format_linuwu_per_zone(cmd),
+            "4287f5,4287f5,4287f5,4287f5,100"
+        );
+    }
+
+    #[test]
+    fn format_linuwu_per_zone_single_zone_leaves_others_black() {
+        let mut cmd = command(0);
+        cmd.zone = 3;
+        cmd.red = 255;
+        cmd.green = 0;
+        cmd.blue = 128;
+        cmd.brightness = 75;
+
+        assert_eq!(
+            format_linuwu_per_zone(cmd),
+            "000000,000000,ff0080,000000,75"
+        );
+    }
+
+    #[test]
+    fn linuwu_backend_writes_dynamic_payload_to_sysfs_files() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let four_zone = dir.path().join("four_zone_mode");
+        let per_zone = dir.path().join("per_zone_mode");
+        std::fs::write(&four_zone, []).expect("four_zone_mode placeholder");
+        std::fs::write(&per_zone, []).expect("per_zone_mode placeholder");
+
+        // SAFETY: test-only env var consumed before any other test sets the override.
+        unsafe { std::env::set_var("NITROSENSE_TEST_LINUWU_RGB_BASE", dir.path()) };
+
+        let mut writer = RecordingWriter::default();
+        apply_rgb_command(&mut writer, command(2)).expect("linuwu dynamic apply should succeed");
+
+        let written =
+            std::fs::read_to_string(&four_zone).expect("four_zone_mode should be readable");
+        assert_eq!(written, "2,5,80,1,10,20,30");
+        assert!(
+            writer.writes.is_empty(),
+            "linuwu backend must not use the legacy character-device writer"
+        );
+
+        unsafe { std::env::remove_var("NITROSENSE_TEST_LINUWU_RGB_BASE") };
+    }
+
+    #[test]
+    fn unavailable_reason_mentions_linuwu_when_module_loaded_without_sysfs() {
+        if linuwu_module_loaded() && linuwu_paths().is_none() {
+            let reason = unavailable_reason();
+            assert!(reason.contains("linuwu_sense"));
+        }
     }
 }

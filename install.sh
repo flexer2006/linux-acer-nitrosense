@@ -74,7 +74,14 @@ install -m 0755 "$binary_src" "${destdir}/usr/bin/nitrosense"
 
 cat > "${destdir}/usr/bin/nitro-sense" <<'EOF'
 #!/bin/sh
-pkexec /usr/bin/nitrosense "$@"
+# Preserve the caller's Wayland/X11 session for pkexec elevation (Hyprland, etc.).
+exec pkexec env \
+    DISPLAY="${DISPLAY-}" \
+    WAYLAND_DISPLAY="${WAYLAND_DISPLAY-}" \
+    XAUTHORITY="${XAUTHORITY-}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}" \
+    DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS-}" \
+    /usr/bin/nitrosense "$@"
 EOF
 chmod 0755 "${destdir}/usr/bin/nitro-sense"
 
@@ -101,3 +108,24 @@ else
 fi
 
 echo "NitroSense installed successfully."
+
+if [ "${DESTDIR:-}" = "" ]; then
+    rgb_ready=0
+    if [ -e /dev/acer-gkbbl-0 ] && [ -e /dev/acer-gkbbl-static-0 ]; then
+        rgb_ready=1
+    elif [ -e /sys/devices/platform/acer-wmi/four_zoned_kb/four_zone_mode ] \
+        && [ -e /sys/devices/platform/acer-wmi/four_zoned_kb/per_zone_mode ]; then
+        rgb_ready=1
+    fi
+
+    if [ "$rgb_ready" -eq 0 ]; then
+        echo "warning: RGB keyboard interface not detected." >&2
+        if [ -d /sys/module/linuwu_sense ]; then
+            echo "warning: linuwu_sense is loaded but four_zoned_kb is missing for this model." >&2
+            echo "warning: For Nitro AN515-4x install acer-predator-turbo-and-rgb-keyboard-linux-module" >&2
+            echo "warning: (unload linuwu_sense first) or enable your model in Linuwu-Sense." >&2
+        elif ls /sys/bus/wmi/devices/7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56-* >/dev/null 2>&1; then
+            echo "warning: Install acer-predator-turbo-and-rgb-keyboard-linux-module or Linuwu-Sense." >&2
+        fi
+    fi
+fi
