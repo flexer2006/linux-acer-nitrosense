@@ -21,26 +21,30 @@ A systems-level rewrite of [Linux-NitroSense](https://github.com/flexer2006/Linu
 
 ## Performance
 
-| Metric | Target | Achieved |
-|--------|--------|----------|
-| Cold startup (GUI visible) | < 100 ms | Measured via `Instant::now()` |
-| RAM RSS (idle) | < 50 MB | 0 heap allocations per frame |
-| CPU (1 Hz background poll) | < 0.5% | Sub-microsecond EC operations |
-| Binary size | < 10 MB | 10.1 MB (with accessibility), 7.5 MB (without) |
-| Test coverage | > 90% | 93.84% line coverage (454 tests) |
+Targets below are still the design goals. The "Measured" column is from a Hyprland session on a Nitro AN515-46 (2026-10-14), release build unless noted.
+
+| Metric                          | Target                     | Measured                                                                    |
+|---------------------------------|----------------------------|-----------------------------------------------------------------------------|
+| Startup until `eframe` starts   | < 100 ms                   | 2.0–2.4 s (`Startup to GUI launch` in the log)                              |
+| RAM RSS after startup           | < 50 MB                    | about 125 MiB                                                               |
+| CPU, 5 s after the window is up | < 0.5%                     | 2.8%                                                                        |
+| Stripped release binary         | < 10 MB                    | 9.47 MiB after dropping unused GUI/AT-SPI crates (was 12.31 MiB)            |
+| Tests                           | hardware-free `cargo test` | 461 passed on the dependency-update pass; no coverage percentage is claimed |
+
+The GUI repaints about once a second. Glow vertical sync is off: on Hyprland, waiting inside `eglSwapBuffers` made the compositor report the window as not responding. The winit loop runs on the main thread, outside `tokio::block_on`.
 
 ## Supported Models
 
-| Model Family | Register Map | DMI Pattern | Status |
-|---|---|---|---|
-| AN515-45 | `AN515_46_REGS` | `Nitro AN515-45` | Primary |
-| AN515-46 | `AN515_46_REGS` | `Nitro AN515-46` | Primary |
-| AN515-54 | `AN515_46_REGS` | `Nitro AN515-54` | Primary |
-| AN515-56 | `AN515_46_REGS` | `Nitro AN515-56` | Primary |
-| AN515-57 | `AN515_46_REGS` | `Nitro AN515-57` | Primary |
-| AN515-58 | `AN515_46_REGS` | `Nitro AN515-58` | Primary |
-| AN515-44 | `AN515_44_REGS` | `Nitro AN515-44` | Primary |
-| AN517-55 | `AN515_46_REGS` | `Nitro AN517-55` | Primary |
+| Model Family | Register Map    | DMI Pattern      | Status  |
+|--------------|-----------------|------------------|---------|
+| AN515-45     | `AN515_46_REGS` | `Nitro AN515-45` | Primary |
+| AN515-46     | `AN515_46_REGS` | `Nitro AN515-46` | Primary |
+| AN515-54     | `AN515_46_REGS` | `Nitro AN515-54` | Primary |
+| AN515-56     | `AN515_46_REGS` | `Nitro AN515-56` | Primary |
+| AN515-57     | `AN515_46_REGS` | `Nitro AN515-57` | Primary |
+| AN515-58     | `AN515_46_REGS` | `Nitro AN515-58` | Primary |
+| AN515-44     | `AN515_44_REGS` | `Nitro AN515-44` | Primary |
+| AN517-55     | `AN515_46_REGS` | `Nitro AN517-55` | Primary |
 
 The application refuses to start with a clear error message on unsupported models.
 
@@ -48,7 +52,7 @@ The application refuses to start with a clear error message on unsupported model
 
 ### Required
 
-- **Rust** 1.95.0+ (`rustup update stable`)
+- **Rust** 1.95.0 or newer (`rustup update stable`). The crate floor stays 1.95.0. The tree was exercised with stable 1.99.0.
 - **C23-capable compiler** — GCC 14+ or Clang 18+
 - **FASM** (flat assembler) — optional; assembly optimizations are disabled gracefully if absent
 - **Kernel modules** — `ec_sys` (with `write_support=y`) or `acpi_ec`
@@ -69,11 +73,11 @@ The release binary is at `target/release/nitrosense`. The build system (`build.r
 
 ### Build Dependencies
 
-| Tool | Purpose |
-|------|---------|
-| `cargo` | Rust build system |
+| Tool       | Purpose                                                  |
+|------------|----------------------------------------------------------|
+| `cargo`    | Rust build system                                        |
 | `cc` crate | Compiles C23 sources (`ec_lowlevel.c`, `msr_lowlevel.c`) |
-| FASM | Compiles `port_io.asm` (optional; graceful fallback) |
+| FASM       | Compiles `port_io.asm` (optional; graceful fallback)     |
 
 ## Install
 
@@ -119,11 +123,15 @@ nitro-sense
 sudo nitrosense
 ```
 
-The pkexec wrapper elevates privileges via polkit. The GUI provides three tabs:
+The `nitro-sense` wrapper runs `pkexec /usr/bin/nitrosense`. Polkit rule `com.nitrosense.launch` matches that path, allows a GUI agent, and keeps the authorization for the active session. `pkexec` does not forward the desktop environment on a kept authorization, so the elevated process restores Wayland from `PKEXEC_UID` (or `SUDO_UID` when started with sudo). Launchers such as Fuzzel therefore work on the second start, not only the first.
 
-- **Fan Control** — Performance profile selection, turbo toggle, per-fan mode and manual speed
+The window is resizable. The fan tab scrolls, so undervolt, save, and exit stay reachable when the window is not fullscreen. Glow is the renderer (`eframe` 0.36, default features off so wgpu is not linked).
+
+The GUI provides three tabs:
+
+- **Fan Control** — Performance profile, turbo, per-fan mode and manual speed, then power and undervolt settings
 - **Monitoring** — CPU/GPU/System temperatures, fan RPMs, power status, voltage readings
-- **Keyboard** — RGB mode, zone, speed, brightness, direction, color picker (hidden if RGB devices unavailable)
+- **Keyboard** — RGB mode, zone, speed, brightness, direction, and a color strip for static mode (hidden if RGB devices are unavailable)
 
 ### CLI Mode
 
@@ -155,12 +163,19 @@ Your laptop's DMI product name (read from `/sys/class/dmi/id/product_name`) is n
 
 NitroSense requires either root or `cap_sys_rawio` + `cap_sys_admin` capabilities. The pkexec wrapper handles this automatically for GUI launches. For CLI usage, run with `sudo`.
 
+### Fuzzel or the app menu does nothing on the second launch
+
+The first `pkexec` shows a password dialog and can copy the Wayland variables. Later launches reuse `auth_admin_keep` and start with an empty session. Install this tree so `/usr/bin/nitrosense` is the build that reads `PKEXEC_UID`. The menu entry must be `/usr/bin/nitro-sense`, which executes `pkexec /usr/bin/nitrosense` and does not insert `/usr/bin/env`. If elevation is refused, a desktop notification is sent.
+
+### Hyprland says the application is not responding
+
+Use this build. The window loop is not inside the Tokio runtime, and glow does not wait on vertical sync. The window class is `linux-nitrosense`.
+
 ### EC access errors (No such file or directory)
 
-The kernel EC module is not loaded. Load it manually:
+If `/sys/kernel/debug/ec/ec0/io` is missing, the program tries to mount debugfs and load `ec_sys` with `write_support=y`. It does not unload a module that already opened. If the node exists but is not writable, load it yourself:
 
 ```sh
-sudo modprobe -r ec_sys 2>/dev/null   # unload first (required if loaded without write_support)
 sudo modprobe ec_sys write_support=y
 ```
 
@@ -222,15 +237,15 @@ See [docs/architecture.md](docs/architecture.md) for detailed data flow, command
 
 ## Technology Stack
 
-| Layer | Technology | Version | Role |
-|-------|-----------|---------|------|
-| Core + GUI | Rust | 1.95.0 (Edition 2024) | Application logic, state machine, GUI |
-| GUI Framework | egui (via eframe) | 0.31+ | Immediate-mode, GPU-accelerated native GUI |
-| Hardware Abstraction | C | C23 (ISO/IEC 9899:2024) | Low-level EC/MSR access |
-| Micro-optimizations | x86_64 Assembly | FASM | Direct `inb`/`outb`/`rdmsr`/`wrmsr` |
-| Async Runtime | tokio | 1.40+ | Async I/O, timers, process spawning |
-| Serialization | serde + toml | Latest | TOML-based configuration |
-| Logging | tracing | Latest | Structured logging, optional journald |
+| Layer                | Technology      | Version                                        | Role                                        |
+|----------------------|-----------------|------------------------------------------------|---------------------------------------------|
+| Core + GUI           | Rust            | 1.95.0 floor, edition 2024 (built with 1.99.0) | Application logic, state machine, GUI       |
+| GUI Framework        | egui via eframe | 0.36                                           | Immediate-mode GUI, glow on Wayland and X11 |
+| Hardware Abstraction | C               | C23 (`-std=c2x`)                               | EC and MSR access through `ec_ops`          |
+| Micro-optimizations  | x86_64 Assembly | FASM ELF64                                     | `inb` / `outb` / `rdmsr` / `wrmsr`          |
+| Async Runtime        | tokio           | 1.x (lock 1.53)                                | Timers and blocking EC / `amdctl` work      |
+| Serialization        | serde + toml    | toml 0.8 line                                  | TOML configuration under `/etc/nitrosense/` |
+| Logging              | tracing         | 0.1                                            | Structured logs on stderr                   |
 
 ## License
 

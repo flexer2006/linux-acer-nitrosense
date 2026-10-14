@@ -90,7 +90,7 @@ impl<D: EcDevice + 'static> NitroSenseApp<D> {
 }
 
 impl<D: EcDevice + 'static> eframe::App for NitroSenseApp<D> {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Apply custom dark theme (idempotent — egui deduplicates identical visuals)
         apply_theme(ctx);
 
@@ -99,17 +99,21 @@ impl<D: EcDevice + 'static> eframe::App for NitroSenseApp<D> {
             return;
         }
 
-        // Only clone telemetry snapshot when data has actually changed,
-        // avoiding a per-frame heap allocation of the 40-byte TelemetrySnapshot.
+        // Only copy telemetry snapshot when data has actually changed.
         if self.telemetry_rx.has_changed().unwrap_or(false) {
-            let snapshot = self.telemetry_rx.borrow_and_update().clone();
+            let snapshot = *self.telemetry_rx.borrow_and_update();
             if let Ok(mut state) = self.state.try_lock() {
                 state.apply_telemetry(&snapshot, self.regs);
             }
         }
 
-        // Render tab bar at top
-        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+        // Request repaint at 1 Hz for telemetry updates. Not painting.
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Render tab bar at top. egui 0.36 panels take a Ui, not a Context.
+        egui::Panel::top("tab_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::FanControl, "Fan Control");
                 ui.selectable_value(&mut self.active_tab, Tab::Monitoring, "Monitoring");
@@ -117,35 +121,43 @@ impl<D: EcDevice + 'static> eframe::App for NitroSenseApp<D> {
             });
         });
 
-        // Display error banner (if any), then clear after showing.
-        // Acquire the lock once to read last_error; Option::clone on None
-        // is just a discriminant copy (trivially cheap), so no separate
-        // is_some() guard is needed. This avoids a TOCTOU race that the
-        // previous triple-lock pattern had.
-        let last_error = self
-            .state
-            .try_lock()
-            .ok()
-            .and_then(|guard| guard.last_error.clone());
-        if let Some(ref error_msg) = last_error {
-            egui::TopBottomPanel::bottom("error_bar").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(255, 80, 80), error_msg);
-                    if ui.small_button("Dismiss").clicked()
-                        && let Ok(mut s) = self.state.try_lock()
-                    {
-                        s.last_error = None;
-                    }
+        // Display error banner (if any), then clear when Dismiss is clicked.
+        // Render directly from the borrowed lock guard to avoid cloning
+        // last_error (String) on every frame while the banner is visible.
+        if let Ok(mut state_guard) = self.state.try_lock()
+            && state_guard.last_error.is_some()
+        {
+            let mut dismiss = false;
+            if let Some(error_msg) = state_guard.last_error.as_deref() {
+                egui::Panel::bottom("error_bar").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(255, 80, 80), error_msg);
+                        if ui.small_button("Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                    });
                 });
-            });
+            }
+            if dismiss {
+                state_guard.last_error = None;
+            }
         }
 
-        // Render active tab content.
-        // Instead of cloning the entire AppState every frame, we borrow the
-        // lock and render directly. This eliminates a ~200-byte heap allocation
-        // per frame (AppState contains String fields for undervolt_status,
-        // rgb_config, last_error). If the lock is contended, we show "Loading...".
-        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
+        // The body must be exactly the space left under the tab bar.
+        // A CentralPanel clips overflow, which cut off Apply Undervolt and
+        // everything below it. The scroll viewport is that remaining height.
+        let body_height = ui.available_height();
+        egui::ScrollArea::vertical()
+            .max_height(body_height)
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show(ui, |ui| self.show_active_tab(ui));
+    }
+}
+
+impl<D: EcDevice + 'static> NitroSenseApp<D> {
+    fn show_active_tab(&mut self, ui: &mut egui::Ui) {
+        match self.active_tab {
             Tab::FanControl => {
                 if let Ok(state_guard) = self.state.try_lock() {
                     crate::ui::fans::render(ui, &state_guard, &self.command_tx);
@@ -173,18 +185,17 @@ impl<D: EcDevice + 'static> eframe::App for NitroSenseApp<D> {
             }
             Tab::Keyboard => {
                 if let Ok(mut state_guard) = self.state.try_lock() {
-                    let mut rgb_editor = state_guard.rgb_config.clone();
-                    let before_editor = rgb_editor.clone();
                     let rgb_available = state_guard.rgb_available;
-                    let actions = crate::ui::keyboard::render(ui, &mut rgb_editor, rgb_available);
+                    let actions =
+                        crate::ui::keyboard::render(ui, &mut state_guard.rgb_config, rgb_available);
 
-                    // Write directly through the existing guard instead of
-                    // attempting a second try_lock() — tokio::sync::Mutex is
-                    // NOT reentrant, so a nested try_lock() would always fail
-                    // and the RGB edit would be silently lost.
-                    if rgb_editor != before_editor {
-                        state_guard.rgb_config = rgb_editor.clone();
+                    // Sync self.rgb_editor only when the config actually changed,
+                    // avoiding unnecessary RgbConfig copies when the editor is idle.
+                    if self.rgb_editor != state_guard.rgb_config {
+                        self.rgb_editor = state_guard.rgb_config;
                     }
+                    let current_rgb = state_guard.rgb_config;
+                    drop(state_guard);
 
                     if actions.load_clicked {
                         self.send_command(Command::LoadRgbConfig);
@@ -194,7 +205,7 @@ impl<D: EcDevice + 'static> eframe::App for NitroSenseApp<D> {
                         }
 
                         if actions.apply_clicked {
-                            self.send_command(Command::ApplyRgb(rgb_editor));
+                            self.send_command(Command::ApplyRgb(current_rgb));
                         }
                     }
                 } else {
@@ -203,10 +214,7 @@ impl<D: EcDevice + 'static> eframe::App for NitroSenseApp<D> {
                     });
                 }
             }
-        });
-
-        // Request repaint at 1 Hz for telemetry updates
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 }
 
@@ -459,11 +467,18 @@ mod tests {
         prepare(app);
         let ctx = egui::Context::default();
         ctx.set_fonts(egui::FontDefinitions::empty());
-        let mut frame = eframe::Frame::_new_kittest();
-        let _ = ctx.run(Default::default(), |ctx| {
-            <NitroSenseApp<RecordingEcDevice> as eframe::App>::update(app, ctx, &mut frame);
-        });
+        drive_frame(app, &ctx);
         ctx
+    }
+
+    /// One eframe 0.36 frame: `logic` then `ui`, matching `EpiIntegration::update`.
+    fn drive_frame(app: &mut NitroSenseApp<RecordingEcDevice>, ctx: &egui::Context) {
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run_ui(Default::default(), |ui| {
+            <NitroSenseApp<RecordingEcDevice> as eframe::App>::logic(app, ui.ctx(), &mut frame);
+            <NitroSenseApp<RecordingEcDevice> as eframe::App>::ui(app, ui, &mut frame);
+        });
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -545,12 +560,7 @@ mod tests {
             app.active_tab = tab;
             let ctx = egui::Context::default();
             ctx.set_fonts(egui::FontDefinitions::empty());
-            let mut frame = eframe::Frame::_new_kittest();
-            let _ = ctx.run(Default::default(), |ctx| {
-                <NitroSenseApp<RecordingEcDevice> as eframe::App>::update(
-                    &mut app, ctx, &mut frame,
-                );
-            });
+            drive_frame(&mut app, &ctx);
         }
     }
 
@@ -573,15 +583,15 @@ mod tests {
         // try_lock).
         {
             let mut state_guard = app.state.try_lock().unwrap();
-            let mut rgb_editor = state_guard.rgb_config.clone();
-            let before_editor = rgb_editor.clone();
+            let mut rgb_editor = state_guard.rgb_config;
+            let before_editor = rgb_editor;
 
             // Simulate a user edit (e.g. changing mode from 0 to 3)
             rgb_editor.mode = 3;
 
             // This is the fixed code path — write through the existing guard
             assert_ne!(rgb_editor, before_editor, "editor must have changed");
-            state_guard.rgb_config = rgb_editor.clone();
+            state_guard.rgb_config = rgb_editor;
         }
 
         // Verify the change propagated to the shared state

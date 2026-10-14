@@ -38,7 +38,7 @@ void msr_close(int fd) {
     }
 }
 
-int msr_read(int fd, uint32_t msr, uint64_t *out) {
+int msr_read(int fd, uint32_t msr, uint64_t *restrict out) {
     if (fd < 0 || !out) {
         return -EINVAL;
     }

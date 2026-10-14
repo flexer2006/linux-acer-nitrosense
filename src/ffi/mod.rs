@@ -180,6 +180,7 @@ mod tests {
         {
             let mut s = MOCK_STATE.lock().unwrap();
             s.open_results.push(-libc::ENOENT);
+            s.open_results.push(-libc::ENOENT);
             s.open_results.push(-libc::EACCES);
         }
         let mut device = RawEcDevice::new();
@@ -412,7 +413,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn ec_open_succeeds_via_ec_sys_path_and_records_modprobe_calls() {
+    fn ec_open_succeeds_via_ec_sys_path_without_reloading_the_module() {
         let _guard = install_mocks();
         let mut handle = EcHandle {
             fd: -1,
@@ -439,12 +440,39 @@ mod tests {
             "ec_open must request /sys/kernel/debug/ec/ec0/io first"
         );
         assert!(
-            s.systems.iter().any(|c| c.contains("modprobe -r ec_sys")),
-            "ec_open must unload ec_sys before reload"
+            s.systems.iter().all(|cmd| !cmd.contains("modprobe")),
+            "an already openable ec_sys must not be reloaded: {:?}",
+            s.systems
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn ec_open_loads_ec_sys_without_unloading_when_the_path_is_missing() {
+        let _guard = install_mocks();
+        {
+            let mut s = MOCK_STATE.lock().unwrap();
+            s.open_results.push(-libc::ENOENT);
+        }
+        let mut handle = EcHandle {
+            fd: -1,
+            uses_ec_sys: false,
+        };
+
+        let rc = unsafe { bindings::ec_open(&mut handle) };
+
+        assert_eq!(rc, 0, "modprobe then a successful open must succeed");
+        assert!(handle.uses_ec_sys);
+        let s = MOCK_STATE.lock().unwrap();
+        assert!(
+            s.systems.iter().any(|cmd| cmd.contains("write_support=y")),
+            "a missing ec_sys path must request the module: {:?}",
+            s.systems
         );
         assert!(
-            s.systems.iter().any(|c| c.contains("write_support=y")),
-            "ec_open must reload ec_sys with write_support=y"
+            s.systems.iter().all(|cmd| !cmd.contains("modprobe -r")),
+            "ec_open must not unload ec_sys: {:?}",
+            s.systems
         );
     }
 
@@ -454,6 +482,7 @@ mod tests {
         let _guard = install_mocks();
         {
             let mut s = MOCK_STATE.lock().unwrap();
+            s.open_results.push(-libc::ENOENT);
             s.open_results.push(-libc::ENOENT);
         }
         let mut handle = EcHandle {
@@ -470,11 +499,27 @@ mod tests {
         assert!(!handle.uses_ec_sys, "fallback path must clear uses_ec_sys");
 
         let s = MOCK_STATE.lock().unwrap();
-        assert_eq!(s.opens.len(), 2, "ec_open should try both EC paths");
-        assert!(s.opens[1].0.contains("/dev/ec"));
         assert!(
-            s.systems.iter().any(|c| c.contains("modprobe acpi_ec")),
-            "ec_open must request acpi_ec to be loaded before fallback open"
+            s.opens.iter().any(|(path, _)| path.contains("/dev/ec")),
+            "ec_open should try /dev/ec after ec_sys stays missing: {:?}",
+            s.opens
+        );
+        assert!(
+            s.systems.iter().any(|cmd| cmd.contains("write_support=y")),
+            "a missing ec_sys node must request the module before giving up: {:?}",
+            s.systems
+        );
+        assert!(
+            s.systems.iter().all(|cmd| !cmd.contains("modprobe -r")),
+            "fallback must not unload ec_sys: {:?}",
+            s.systems
+        );
+        assert!(
+            s.systems
+                .iter()
+                .all(|cmd| !cmd.contains("modprobe acpi_ec")),
+            "an openable /dev/ec must not load acpi_ec: {:?}",
+            s.systems
         );
     }
 
@@ -484,6 +529,7 @@ mod tests {
         let _guard = install_mocks();
         {
             let mut s = MOCK_STATE.lock().unwrap();
+            s.open_results.push(-libc::ENOENT);
             s.open_results.push(-libc::ENOENT);
             s.open_results.push(-libc::EACCES);
         }
@@ -510,6 +556,41 @@ mod tests {
             rc,
             -libc::EINVAL,
             "ec_open(NULL) must return -EINVAL per C precondition"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn ec_open_returns_helper_failure_when_module_load_fails_and_paths_stay_missing() {
+        let _guard = install_mocks();
+        {
+            let mut s = MOCK_STATE.lock().unwrap();
+            s.open_results.extend_from_slice(&[
+                -libc::ENOENT,
+                -libc::ENOENT,
+                -libc::ENOENT,
+                -libc::ENOENT,
+            ]);
+            s.system_results.extend_from_slice(&[1, 1, 1, 1]);
+        }
+        let mut handle = EcHandle {
+            fd: -1,
+            uses_ec_sys: false,
+        };
+
+        let rc = unsafe { bindings::ec_open(&mut handle) };
+
+        assert_eq!(rc, -libc::EIO, "a failed helper must not be discarded");
+        let s = MOCK_STATE.lock().unwrap();
+        assert!(
+            s.systems.iter().any(|cmd| cmd.contains("modprobe")),
+            "missing nodes must still attempt module load: {:?}",
+            s.systems
+        );
+        assert!(
+            s.systems.iter().all(|cmd| !cmd.contains("modprobe -r")),
+            "helper failure path must not unload ec_sys: {:?}",
+            s.systems
         );
     }
 

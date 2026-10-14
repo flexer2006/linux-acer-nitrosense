@@ -63,21 +63,13 @@ fn install_script_never_builds_release_binary_as_root() {
 }
 
 #[test]
-fn pkexec_wrapper_preserves_gui_session_environment() {
+fn pkexec_wrapper_authorizes_the_nitrosense_binary() {
     let contents = fs::read_to_string(Path::new(ROOT).join("install.sh")).unwrap();
-    assert!(contents.contains("pkexec env"));
-    for key in [
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "XAUTHORITY",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-    ] {
-        assert!(
-            contents.contains(key),
-            "nitro-sense wrapper should preserve {key}"
-        );
-    }
+    assert!(contents.contains("exec pkexec /usr/bin/nitrosense \"$@\""));
+    assert!(
+        !contents.contains("pkexec env"),
+        "authorizing /usr/bin/env skips com.nitrosense.launch and the next fuzzel launch is silent"
+    );
 }
 
 #[test]

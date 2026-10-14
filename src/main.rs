@@ -84,8 +84,75 @@ struct WorkerHandles {
     signal: tokio::task::JoinHandle<()>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+enum Startup {
+    Finished,
+    Gui(GuiSession),
+}
+
+struct GuiSession {
+    app: NitroSenseApp<RawEcDevice>,
+    state: Arc<Mutex<AppState>>,
+    regs: &'static RegisterMap,
+    config_manager: ConfigManager,
+    command_tx: mpsc::Sender<Command>,
+    handles: WorkerHandles,
+}
+
+fn main() -> anyhow::Result<()> {
+    if gui_session::should_restore_wayland(gui_session::wayland_ready()) {
+        let _ = gui_session::ensure_from_invoking_user();
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    match runtime.block_on(async_main())? {
+        Startup::Finished => Ok(()),
+        Startup::Gui(session) => run_gui(session, &runtime),
+    }
+}
+
+/// The winit loop runs on this thread, outside `Runtime::block_on`.
+/// Hyprland's xdg ping is unanswered while that loop shares the blocked
+/// runtime thread, which opens the "not responding" dialog.
+fn run_gui(session: GuiSession, runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    let GuiSession {
+        app,
+        state,
+        regs,
+        config_manager,
+        command_tx,
+        handles,
+    } = session;
+
+    let mut native_options = gui_native_options();
+    if gui_session::wayland_ready() {
+        native_options.event_loop_builder = Some(Box::new(|event_loop| {
+            use winit::platform::wayland::EventLoopBuilderExtWayland;
+            event_loop.with_wayland();
+        }));
+    }
+
+    info!("Launching GUI");
+    let gui_result = eframe::run_native(
+        "Linux NitroSense",
+        native_options,
+        Box::new(|_cc| Ok(Box::new(app))),
+    );
+
+    runtime.block_on(shutdown_application(
+        &state,
+        regs,
+        &config_manager,
+        &command_tx,
+        handles,
+    ));
+    info!("NitroSense shutdown complete");
+    gui_result.map_err(|err| anyhow::anyhow!("GUI error: {err}"))
+}
+
+async fn async_main() -> anyhow::Result<Startup> {
     let startup_begin = std::time::Instant::now();
 
     let cli = CliOptions::parse();
@@ -101,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     if !has_required_privileges() {
         warn!("NitroSense requires root or cap_sys_rawio+cap_sys_admin; relaunching");
         relaunch_with_pkexec()?;
-        return Ok(());
+        return Ok(Startup::Finished);
     }
 
     let model = detect_model()?;
@@ -161,13 +228,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut initial_state = AppState::default();
     initial_state.apply_telemetry(&initial_snapshot, register_map);
-    initial_state.rgb_config = rgb_config.clone();
+    initial_state.rgb_config = rgb_config;
     initial_state.rgb_available = rgb_available;
 
     seed_voltage_state(&mut initial_state, cpu_vendor);
 
     let app_state = Arc::new(Mutex::new(initial_state));
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_snapshot.clone());
+    let (telemetry_tx, telemetry_rx) = watch::channel(initial_snapshot);
     let (command_tx, command_rx) = mpsc::channel::<Command>(100);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -239,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
         info!("NitroSense shutdown complete");
-        return Ok(());
+        return Ok(Startup::Finished);
     }
 
     let startup_elapsed = startup_begin.elapsed();
@@ -248,11 +315,11 @@ async fn main() -> anyhow::Result<()> {
         startup_elapsed.as_secs_f64() * 1000.0
     );
 
-    if !gui_session::ready() && gui_session::ensure_from_invoking_user() {
-        info!("Restored GUI session environment from invoking user");
-    }
-
     if !gui_session::ready() {
+        notify_user(
+            "Linux NitroSense",
+            "Could not attach to the Hyprland session after elevation. Launch it once from a terminal to see the details.",
+        );
         return Err(anyhow::anyhow!(
             "Cannot connect to a display server. On Wayland compositors such as Hyprland, \
              launch NitroSense via `nitro-sense` from your desktop session instead of \
@@ -272,45 +339,47 @@ async fn main() -> anyhow::Result<()> {
         undervolt_core: 0,
     });
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, 700.0])
-            .with_resizable(false)
-            .with_title("Linux NitroSense")
-            .with_icon(load_window_icon()),
-        ..Default::default()
-    };
-
-    info!("Launching GUI");
-    eframe::run_native(
-        "Linux NitroSense",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(app))),
-    )
-    .map_err(|e| anyhow::anyhow!("GUI error: {e}"))?;
-
-    shutdown_application(
-        &app_state,
-        register_map,
-        &config_manager,
-        &command_tx,
-        WorkerHandles {
+    Ok(Startup::Gui(GuiSession {
+        app,
+        state: app_state,
+        regs: register_map,
+        config_manager,
+        command_tx,
+        handles: WorkerHandles {
             poller: poller_handle,
             voltage: voltage_handle,
             command: command_handle,
             signal: signal_handle,
         },
-    )
-    .await;
-
-    info!("NitroSense shutdown complete");
-    Ok(())
+    }))
 }
 
 /// Load embedded window icon from pre-converted RGBA binary.
 /// Format: u32 LE width + u32 LE height + raw RGBA pixel data.
 ///
 /// Uses `OnceLock` to avoid re-allocating the RGBA Vec on every call.
+/// Window shell for the glow backend on Hyprland.
+///
+/// `vsync` stays off. With `SwapInterval::Wait`, `eglSwapBuffers` blocks the
+/// winit thread, so Hyprland's xdg ping is not answered and the compositor
+/// opens "application not responding" every few seconds. Repaints are already
+/// requested once per second from `NitroSenseApp::logic`.
+fn gui_native_options() -> eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([520.0, 720.0])
+            .with_min_inner_size([420.0, 480.0])
+            .with_resizable(true)
+            .with_title("Linux NitroSense")
+            .with_app_id("linux-nitrosense")
+            .with_icon(load_window_icon()),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+    options.glow_options.vsync = false;
+    options
+}
+
 fn load_window_icon() -> egui::IconData {
     static ICON: OnceLock<egui::IconData> = OnceLock::new();
     ICON.get_or_init(|| {
@@ -498,18 +567,39 @@ fn cap_mask_has_required_caps(mask: u64) -> bool {
 
 fn relaunch_with_pkexec() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    let mut command = ProcessCommand::new("pkexec");
-    command.arg("env");
-
-    for assignment in gui_session::env_assignments() {
-        command.arg(assignment);
+    // Authorize this binary, not `/usr/bin/env`. The polkit rule matches
+    // `/usr/bin/nitrosense` only. `pkexec env ...` misses that rule, so a
+    // later fuzzel launch has no tty and exits before any window exists.
+    // Kept authorization also drops the desktop environment; the elevated
+    // process restores it from PKEXEC_UID.
+    let status = ProcessCommand::new("pkexec")
+        .arg(&exe)
+        .args(std::env::args_os().skip(1))
+        .status()?;
+    let code = status.code().unwrap_or(1);
+    if code != 0 {
+        notify_user(
+            "Linux NitroSense",
+            &format!("Administrator rights were not granted (pkexec exit {code})."),
+        );
     }
+    std::process::exit(code);
+}
 
-    command.arg(exe);
-    command.args(std::env::args_os().skip(1));
-
-    let status = command.status()?;
-    std::process::exit(status.code().unwrap_or(1));
+fn notify_user(summary: &str, body: &str) {
+    let mut command = ProcessCommand::new("notify-send");
+    if let Some(uid) = gui_session::session_uid(
+        std::env::var("PKEXEC_UID").ok().as_deref(),
+        std::env::var("SUDO_UID").ok().as_deref(),
+    ) {
+        let runtime = format!("/run/user/{uid}");
+        command.env("XDG_RUNTIME_DIR", &runtime);
+        command.env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={runtime}/bus"),
+        );
+    }
+    let _ = command.args([summary, body]).status();
 }
 
 fn validate_rgb_config(config: &RgbConfig) -> Result<(), NitroError> {
@@ -771,7 +861,7 @@ async fn run_headless(
                 if changed.is_err() {
                     break;
                 }
-                let snapshot = telemetry_rx.borrow_and_update().clone();
+                let snapshot = *telemetry_rx.borrow_and_update();
                 let mut state_guard = state.lock().await;
                 state_guard.apply_telemetry(&snapshot, regs);
                 println!("{}", format_status(&state_guard));
@@ -854,7 +944,7 @@ async fn run_command_worker<D: EcDevice + 'static>(
             Command::SaveRgbConfig => {
                 let rgb = {
                     let state_guard = state.lock().await;
-                    state_guard.rgb_config.clone()
+                    state_guard.rgb_config
                 };
                 if let Err(err) = config_manager.save_rgb_config(&rgb) {
                     error!("Failed to save RGB config: {}", err);
@@ -872,7 +962,7 @@ async fn run_command_worker<D: EcDevice + 'static>(
 
                     {
                         let mut state_guard = state.lock().await;
-                        state_guard.rgb_config = rgb.clone();
+                        state_guard.rgb_config = rgb;
                     }
 
                     if rgb::is_available() {
@@ -897,7 +987,7 @@ async fn run_command_worker<D: EcDevice + 'static>(
 
                 {
                     let mut state_guard = state.lock().await;
-                    state_guard.rgb_config = rgb.clone();
+                    state_guard.rgb_config = rgb;
                 }
 
                 if rgb::is_available() {
@@ -965,9 +1055,7 @@ async fn run_command_worker<D: EcDevice + 'static>(
                 .await
                 {
                     error!("Command execution failed: {}", err);
-                    if let Ok(mut state_guard) = state.try_lock() {
-                        state_guard.last_error = Some(format!("Hardware command failed: {err}"));
-                    }
+                    set_last_error(&state, format!("Hardware command failed: {err}")).await;
                 }
             }
         }
@@ -992,32 +1080,25 @@ fn spawn_voltage_poller(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let voltage_result = tokio::task::spawn_blocking(move || read_voltage_for_vendor(cpu_vendor)).await;
+                    let sample = tokio::task::spawn_blocking(move || {
+                        read_voltage_for_vendor(cpu_vendor)
+                    })
+                    .await;
 
-                    if let Ok(Ok(voltage)) = voltage_result {
-                        tracker.update(voltage);
-                        if let Ok(mut state_guard) = state.try_lock() {
-                            state_guard.voltage = tracker.current;
-                            state_guard.min_voltage = tracker.min;
-                            state_guard.max_voltage = tracker.max;
-                        }
-                    } else if let Ok(Err(err)) = voltage_result {
-                        warn!("Voltage poll failed: {}", err);
-                    } else if let Err(err) = voltage_result {
-                        warn!("Voltage poll join failed: {}", err);
-                    }
-
-                    if cpu_vendor == CpuVendor::Amd {
-                        let status_result = tokio::task::spawn_blocking(read_amd_undervolt_status).await;
-
-                        if let Ok(Ok(status)) = status_result {
+                    match sample {
+                        Ok(Ok(voltage)) => {
                             if let Ok(mut state_guard) = state.try_lock() {
-                                state_guard.undervolt_status = status;
+                                tracker.update(voltage);
+                                state_guard.voltage = tracker.current;
+                                state_guard.min_voltage = tracker.min;
+                                state_guard.max_voltage = tracker.max;
                             }
-                        } else if let Ok(Err(err)) = status_result {
-                            warn!("AMD undervolt status poll failed: {}", err);
-                        } else if let Err(err) = status_result {
-                            warn!("AMD undervolt status poll join failed: {}", err);
+                        }
+                        Ok(Err(err)) => {
+                            warn!("Voltage poll failed: {}", err);
+                        }
+                        Err(err) => {
+                            warn!("Voltage poll join failed: {}", err);
                         }
                     }
                 }
@@ -1041,6 +1122,16 @@ mod tests {
         let icon = load_window_icon();
         assert_eq!(icon.width, 64);
         assert_eq!(icon.height, 64);
+    }
+
+    #[test]
+    fn gui_window_scrolls_and_does_not_wait_on_vsync() {
+        let options = gui_native_options();
+        assert!(!options.glow_options.vsync);
+        assert_eq!(options.renderer, eframe::Renderer::Glow);
+        assert_eq!(options.viewport.resizable, Some(true));
+        assert_eq!(options.viewport.app_id.as_deref(), Some("linux-nitrosense"));
+        assert!(options.viewport.inner_size.unwrap().y >= 700.0);
     }
 
     #[test]
@@ -1764,6 +1855,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_worker_records_hardware_error_after_state_lock_is_released() {
+        let (runtime, _ec, state, _t, _s, _c, _writes) = build_runtime();
+        let CliRuntime {
+            regs,
+            config_manager,
+            ..
+        } = runtime;
+
+        let failing = FailingEcDevice::default();
+        let ec = Arc::new(TokioMutex::new(
+            Ec::new(failing, &AN515_46_REGS).with_min_write_interval(Duration::ZERO),
+        ));
+        let (cmd_tx, cmd_rx) = tokio_mpsc::channel::<Command>(8);
+        let (shutdown_tx, _shutdown_rx) = tokio_watch::channel(false);
+        let worker = tokio::spawn(run_command_worker(
+            cmd_rx,
+            ec,
+            Arc::clone(&state),
+            config_manager,
+            regs,
+            shutdown_tx,
+            CpuVendor::Unknown,
+        ));
+
+        let hold = state.lock().await;
+        cmd_tx
+            .send(Command::SetProfile(PerformanceProfile::Quiet))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(hold);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.lock().await.last_error.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("hardware failure must reach last_error after the UI releases the lock");
+
+        let message = state.lock().await.last_error.clone();
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|text| text.contains("Hardware command failed")),
+            "banner text must name the hardware failure: {message:?}"
+        );
+
+        cmd_tx.send(Command::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), worker).await;
+    }
+
+    #[derive(Debug)]
+    struct FailingEcDevice {
+        buffer: [u8; 256],
+    }
+
+    impl Default for FailingEcDevice {
+        fn default() -> Self {
+            Self { buffer: [0; 256] }
+        }
+    }
+
+    impl nitrosense::hardware::ec::EcDevice for FailingEcDevice {
+        fn open(&mut self) -> Result<(), NitroError> {
+            Ok(())
+        }
+        fn close(&mut self) {}
+        fn refresh(&mut self, buffer: &mut [u8]) -> Result<usize, NitroError> {
+            buffer.copy_from_slice(&self.buffer);
+            Ok(self.buffer.len())
+        }
+        fn write_byte(&mut self, addr: u8, _val: u8) -> Result<(), NitroError> {
+            Err(NitroError::EcWrite {
+                addr,
+                source: std::io::Error::other("mock write failed"),
+            })
+        }
+    }
+
+    #[tokio::test]
     async fn run_command_worker_apply_undervolt_marks_unsupported_for_intel() {
         let (runtime, _ec, state, _t, _s, _c, _writes) = build_runtime();
         let CliRuntime {
@@ -1916,7 +2091,7 @@ mod tests {
             green: 220,
             blue: 100,
         };
-        cmd_tx.send(Command::ApplyRgb(cfg.clone())).await.unwrap();
+        cmd_tx.send(Command::ApplyRgb(cfg)).await.unwrap();
         cmd_tx.send(Command::Shutdown).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), worker).await;
 

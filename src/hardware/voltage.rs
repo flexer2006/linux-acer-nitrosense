@@ -4,8 +4,14 @@
 use crate::error::NitroError;
 use crate::hardware::msr::Msr;
 use crate::hardware::platform::CpuVendor;
+use crate::ui::fmtbuf::FmtBuf;
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::sync::OnceLock;
+
+static AMDCTL_PATH_CACHE: OnceLock<Option<&'static Path>> = OnceLock::new();
 
 /// Tracks voltage readings over time, maintaining current, min, and max values.
 #[derive(Debug, Clone)]
@@ -57,13 +63,14 @@ pub struct SystemProcessRunner;
 impl ProcessRunner for SystemProcessRunner {
     fn run(&self, cmd: &str, args: &[&str]) -> Result<String, NitroError> {
         let executable = resolve_system_command(cmd)?;
-        let output = StdCommand::new(executable)
+        let output = StdCommand::new(executable.as_os_str())
             .args(args)
             .output()
             .map_err(|e| NitroError::Process(format!("failed to run {cmd} {args:?}: {e}")))?;
 
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            Ok(String::from_utf8(output.stdout)
+                .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             if stderr.is_empty() {
@@ -81,12 +88,37 @@ impl ProcessRunner for SystemProcessRunner {
     }
 }
 
-fn resolve_system_command(cmd: &str) -> Result<PathBuf, NitroError> {
+fn resolve_amdctl_path() -> Result<&'static Path, NitroError> {
+    let cached = AMDCTL_PATH_CACHE.get_or_init(|| {
+        const CANDIDATES: [&str; 6] = [
+            "/usr/local/sbin/amdctl",
+            "/usr/local/bin/amdctl",
+            "/usr/sbin/amdctl",
+            "/usr/bin/amdctl",
+            "/sbin/amdctl",
+            "/bin/amdctl",
+        ];
+        CANDIDATES
+            .into_iter()
+            .map(Path::new)
+            .find(|candidate| candidate.is_file())
+    });
+
+    cached.ok_or_else(|| {
+        NitroError::Process("command 'amdctl' was not found in standard system paths".to_string())
+    })
+}
+
+fn resolve_system_command(cmd: &str) -> Result<Cow<'_, Path>, NitroError> {
+    if cmd == "amdctl" {
+        return resolve_amdctl_path().map(Cow::Borrowed);
+    }
+
     let path = Path::new(cmd);
     if path.is_absolute() || path.components().count() > 1 {
         return path
             .is_file()
-            .then_some(path.to_path_buf())
+            .then_some(Cow::Borrowed(path))
             .ok_or_else(|| NitroError::Process(format!("command '{cmd}' was not found")));
     }
 
@@ -98,9 +130,17 @@ fn resolve_system_command(cmd: &str) -> Result<PathBuf, NitroError> {
         "/sbin",
         "/bin",
     ] {
-        let candidate = Path::new(dir).join(cmd);
-        if candidate.is_file() {
-            return Ok(candidate);
+        let mut buf = FmtBuf::<128>::new();
+        if write!(buf, "{dir}/{cmd}").is_ok() {
+            let candidate = Path::new(buf.as_str());
+            if candidate.is_file() {
+                return Ok(Cow::Owned(PathBuf::from(buf.as_str())));
+            }
+        } else {
+            let candidate = Path::new(dir).join(cmd);
+            if candidate.is_file() {
+                return Ok(Cow::Owned(candidate));
+            }
         }
     }
 
@@ -114,25 +154,38 @@ fn resolve_system_command(cmd: &str) -> Result<PathBuf, NitroError> {
 /// Parse AMD voltage from `amdctl -g -c0` output.
 ///
 /// Extracts millivolt values from lines containing "mV", converts to volts,
-/// and returns the average.
+/// and returns the average without heap allocations.
 pub fn parse_amd_voltage(output: &str) -> Option<f64> {
-    let mut voltages = Vec::new();
+    let mut sum_mv = 0.0_f64;
+    let mut count = 0_usize;
+
     for line in output.lines() {
         if line.contains("mV") {
             for token in line.split_whitespace() {
-                if token.contains("mV") {
-                    let stripped = token.replace("mV", "");
-                    if let Ok(mv) = stripped.parse::<f64>() {
-                        voltages.push(mv / 1000.0);
+                if let Some((prefix, suffix)) = token.split_once("mV")
+                    && suffix.is_empty()
+                    && let Ok(mv) = prefix.parse::<f64>()
+                {
+                    sum_mv += mv;
+                    count += 1;
+                } else if token.contains("mV") {
+                    let mut buf = FmtBuf::<32>::new();
+                    for part in token.split("mV") {
+                        let _ = buf.write_str(part);
+                    }
+                    if let Ok(mv) = buf.as_str().parse::<f64>() {
+                        sum_mv += mv;
+                        count += 1;
                     }
                 }
             }
         }
     }
-    if voltages.is_empty() {
+
+    if count == 0 {
         None
     } else {
-        Some(voltages.iter().sum::<f64>() / voltages.len() as f64)
+        Some((sum_mv / count as f64) / 1000.0)
     }
 }
 
@@ -294,11 +347,11 @@ pub fn compute_intel_voltage(msr_values: &[u64]) -> Option<f64> {
     if msr_values.is_empty() {
         return None;
     }
-    let extracted: Vec<u64> = msr_values
+    let sum: u64 = msr_values
         .iter()
         .map(|v| (v >> 32) & 0xFFFF) // bits 47:32
-        .collect();
-    let avg = extracted.iter().sum::<u64>() as f64 / extracted.len() as f64;
+        .sum();
+    let avg = sum as f64 / msr_values.len() as f64;
     Some(avg / 8192.0)
 }
 
@@ -309,20 +362,29 @@ pub fn compute_intel_voltage(msr_values: &[u64]) -> Option<f64> {
 /// Skips the first 3 lines, then extracts columns 0, 5, 6, 7, 11
 /// from each remaining line (matching original Python logic).
 pub fn parse_amd_undervolt_status(output: &str) -> String {
-    let lines: Vec<&str> = output.lines().skip(3).collect();
     let mut result = String::new();
-    for line in lines {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() > 11 {
-            let col6 = parts[6].replace(".00", "");
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}",
-                parts[0], parts[5], col6, parts[7], parts[11]
-            ));
+    for line in output.lines().skip(3) {
+        let mut iter = line.split_whitespace();
+        let Some(c0) = iter.next() else { continue };
+        let Some(c5) = iter.nth(4) else { continue };
+        let Some(c6) = iter.next() else { continue };
+        let Some(c7) = iter.next() else { continue };
+        let Some(c11) = iter.nth(3) else { continue };
+
+        if !result.is_empty() {
+            result.push('\n');
         }
+        result.push_str(c0);
+        result.push('\t');
+        result.push_str(c5);
+        result.push('\t');
+        for part in c6.split(".00") {
+            result.push_str(part);
+        }
+        result.push('\t');
+        result.push_str(c7);
+        result.push('\t');
+        result.push_str(c11);
     }
     result
 }

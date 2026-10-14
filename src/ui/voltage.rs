@@ -58,6 +58,7 @@ pub fn render(ui: &mut Ui, state: &AppState) {
     });
 }
 
+#[cfg(test)]
 fn format_voltage(value: f64) -> String {
     if value.is_finite() && value < f64::MAX / 2.0 {
         format!("{value:.2} V")

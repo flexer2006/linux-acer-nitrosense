@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2024-2026 NitroSense Contributors
 
-use egui::Ui;
+use egui::color_picker::color_edit_button_rgb;
+use egui::{Color32, ComboBox, DragValue, Sense, Ui, vec2};
 
 use crate::config::model::RgbConfig;
 use crate::hardware::rgb;
@@ -20,91 +21,28 @@ pub struct KeyboardActions {
 pub fn render(ui: &mut Ui, editor: &mut RgbConfig, rgb_available: bool) -> KeyboardActions {
     let mut actions = KeyboardActions::default();
 
-    ui.heading("Keyboard RGB");
+    ui.heading("Keyboard");
     ui.separator();
 
     if !rgb_available {
-        ui.label(rgb::unavailable_reason());
+        ui.label(rgb::cached_unavailable_reason());
         return actions;
     }
 
-    // Mode dropdown
-    ui.horizontal(|ui| {
-        ui.label("Mode:");
-        egui::ComboBox::from_id_salt("rgb_mode")
-            .selected_text(rgb_mode_name(editor.mode))
-            .show_ui(ui, |ui| {
-                for mode in 0..=5u8 {
-                    if ui
-                        .selectable_value(&mut editor.mode, mode, rgb_mode_name(mode))
-                        .clicked()
-                    {
-                        // Mode changed
-                    }
-                }
-            });
-    });
-
-    ui.add_space(8.0);
-
-    // Zone dropdown
-    ui.horizontal(|ui| {
-        ui.label("Zone:");
-        egui::ComboBox::from_id_salt("rgb_zone")
-            .selected_text(rgb_zone_name(editor.zone))
-            .show_ui(ui, |ui| {
-                for zone in 0..=4u8 {
-                    if ui
-                        .selectable_value(&mut editor.zone, zone, rgb_zone_name(zone))
-                        .clicked()
-                    {
-                        // Zone changed
-                    }
-                }
-            });
-    });
-
-    ui.add_space(8.0);
-
-    // Speed spinner (0-9)
-    ui.horizontal(|ui| {
-        ui.label("Speed:");
-        ui.add(egui::DragValue::new(&mut editor.speed).range(0..=9));
-    });
-
-    ui.add_space(8.0);
-
-    // Brightness spinner (0-100)
-    ui.horizontal(|ui| {
-        ui.label("Brightness:");
-        ui.add(egui::DragValue::new(&mut editor.brightness).range(0..=100));
-    });
-
-    ui.add_space(8.0);
-
-    // Direction dropdown
-    ui.horizontal(|ui| {
-        ui.label("Direction:");
-        egui::ComboBox::from_id_salt("rgb_direction")
-            .selected_text(direction_name(editor.direction))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut editor.direction, 1u8, "Right");
-                ui.selectable_value(&mut editor.direction, 2u8, "Left");
-            });
-    });
-
-    ui.add_space(8.0);
-
-    // Color picker (only for static mode)
     if editor.mode == 0 {
+        let color = Color32::from_rgb(editor.red, editor.green, editor.blue);
+        let (rect, _response) =
+            ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        ui.painter().rect_filled(rect, 4.0, color);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("Color:");
+            ui.label("Color");
             let mut rgb = [
                 editor.red as f32 / 255.0,
                 editor.green as f32 / 255.0,
                 editor.blue as f32 / 255.0,
             ];
-            if egui::color_picker::color_edit_button_rgb(ui, &mut rgb).changed() {
+            if color_edit_button_rgb(ui, &mut rgb).changed() {
                 editor.red = (rgb[0] * 255.0) as u8;
                 editor.green = (rgb[1] * 255.0) as u8;
                 editor.blue = (rgb[2] * 255.0) as u8;
@@ -113,9 +51,48 @@ pub fn render(ui: &mut Ui, editor: &mut RgbConfig, rgb_available: bool) -> Keybo
         ui.add_space(8.0);
     }
 
-    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Mode");
+        ComboBox::from_id_salt("rgb_mode")
+            .selected_text(rgb_mode_name(editor.mode))
+            .show_ui(ui, |ui| {
+                for mode in 0..=5u8 {
+                    ui.selectable_value(&mut editor.mode, mode, rgb_mode_name(mode));
+                }
+            });
+        ui.label("Zone");
+        ComboBox::from_id_salt("rgb_zone")
+            .selected_text(rgb_zone_name(editor.zone))
+            .show_ui(ui, |ui| {
+                for zone in 0..=4u8 {
+                    ui.selectable_value(&mut editor.zone, zone, rgb_zone_name(zone));
+                }
+            });
+    });
 
-    // Action buttons
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        ui.label("Speed");
+        ui.add(DragValue::new(&mut editor.speed).range(0..=9));
+        ui.label("Brightness");
+        ui.add(DragValue::new(&mut editor.brightness).range(0..=100));
+    });
+
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        ui.label("Direction");
+        ComboBox::from_id_salt("rgb_direction")
+            .selected_text(direction_name(editor.direction))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut editor.direction, 1u8, "Right");
+                ui.selectable_value(&mut editor.direction, 2u8, "Left");
+            });
+    });
+
+    ui.add_space(10.0);
+
     ui.horizontal(|ui| {
         if ui.button("Apply").clicked() {
             actions.apply_clicked = true;
@@ -161,6 +138,7 @@ fn direction_name(direction: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::run_test_ui;
 
     #[test]
     fn test_rgb_mode_names_all_valid() {
@@ -227,17 +205,6 @@ mod tests {
 
     // ---- Render exercises ----
 
-    /// Run an egui frame inside a CentralPanel with the given (FnMut) builder.
-    /// This is the test-only equivalent of `egui::__run_test_ui` that supports
-    /// closures borrowing mutable test fixtures.
-    fn run_test_ui(mut add_contents: impl FnMut(&mut egui::Ui)) {
-        let ctx = egui::Context::default();
-        ctx.set_fonts(egui::FontDefinitions::empty());
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| add_contents(ui));
-        });
-    }
-
     #[test]
     fn render_keyboard_panel_unavailable_short_circuits_with_default_actions() {
         let mut editor = RgbConfig::default();
@@ -251,10 +218,20 @@ mod tests {
             KeyboardActions::default(),
             "unavailable RGB device must not register any action clicks"
         );
-        assert!(
-            !rgb::unavailable_reason().is_empty(),
-            "unavailable panel should have a setup hint"
-        );
+        // The hint text depends on the host. A detected backend returns an
+        // empty reason; otherwise the panel must show a setup hint. This
+        // stays hardware-free: it does not open the device.
+        if rgb::is_available() {
+            assert!(
+                rgb::unavailable_reason().is_empty(),
+                "a detected RGB backend has no setup hint"
+            );
+        } else {
+            assert!(
+                !rgb::unavailable_reason().is_empty(),
+                "unavailable panel should have a setup hint"
+            );
+        }
     }
 
     #[test]

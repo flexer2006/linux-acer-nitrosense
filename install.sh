@@ -74,14 +74,11 @@ install -m 0755 "$binary_src" "${destdir}/usr/bin/nitrosense"
 
 cat > "${destdir}/usr/bin/nitro-sense" <<'EOF'
 #!/bin/sh
-# Preserve the caller's Wayland/X11 session for pkexec elevation (Hyprland, etc.).
-exec pkexec env \
-    DISPLAY="${DISPLAY-}" \
-    WAYLAND_DISPLAY="${WAYLAND_DISPLAY-}" \
-    XAUTHORITY="${XAUTHORITY-}" \
-    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}" \
-    DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS-}" \
-    /usr/bin/nitrosense "$@"
+# pkexec authorizes the program path. Authorizing env instead of
+# /usr/bin/nitrosense skips com.nitrosense.launch, and the next fuzzel
+# launch exits with no dialog. The elevated process restores the Wayland
+# session from PKEXEC_UID.
+exec pkexec /usr/bin/nitrosense "$@"
 EOF
 chmod 0755 "${destdir}/usr/bin/nitro-sense"
 

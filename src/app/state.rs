@@ -539,7 +539,7 @@ mod tests {
             green: 2,
             blue: 3,
         };
-        state.apply_command(Command::ApplyRgb(cfg.clone())).unwrap();
+        state.apply_command(Command::ApplyRgb(cfg)).unwrap();
         assert_eq!(state.rgb_config, cfg);
     }
 

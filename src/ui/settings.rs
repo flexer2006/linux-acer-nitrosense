@@ -144,9 +144,10 @@ mod tests {
     fn run_test_ui(mut add_contents: impl FnMut(&mut egui::Ui)) {
         let ctx = egui::Context::default();
         ctx.set_fonts(egui::FontDefinitions::empty());
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| add_contents(ui));
+        let output = ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| add_contents(ui));
         });
+        output.drop_without_applying_deltas();
     }
 
     #[test]

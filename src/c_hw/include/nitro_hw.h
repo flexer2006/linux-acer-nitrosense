@@ -44,8 +44,8 @@ void ec_set_ops(const struct ec_ops *ops);
 
 [[nodiscard]] int  ec_open(struct ec_handle *out);
 void               ec_close(struct ec_handle *h);
-[[nodiscard]] int  ec_refresh(struct ec_handle *h, uint8_t *buffer, size_t len);
-[[nodiscard]] int  ec_write_byte(struct ec_handle *h, uint8_t addr, uint8_t val);
+[[nodiscard]] int  ec_refresh(struct ec_handle *restrict h, uint8_t *restrict buffer, size_t len);
+[[nodiscard]] int  ec_write_byte(struct ec_handle *restrict h, uint8_t addr, uint8_t val);
 
 /* ---------- Assembly-backed port I/O ---------- */
 
@@ -58,7 +58,7 @@ void                   asm_wrmsr(uint32_t msr, uint64_t val);
 
 [[nodiscard]] int  msr_open(int cpu);
 void               msr_close(int fd);
-[[nodiscard]] int  msr_read(int fd, uint32_t msr, uint64_t *out);
+[[nodiscard]] int  msr_read(int fd, uint32_t msr, uint64_t *restrict out);
 [[nodiscard]] int  msr_write(int fd, uint32_t msr, uint64_t val);
 
 #endif /* NITRO_HW_H */

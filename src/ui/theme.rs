@@ -7,7 +7,7 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, Id};
 
 /// Apply custom dark theme to the egui context.
 ///
-/// This function is called every frame by the app's `update()` method.
+/// This function is called every frame by the app's `logic()` method.
 /// egui internally deduplicates identical `set_visuals()` calls (it checks
 /// if the new visuals differ from the current ones before marking the UI
 /// as needing a repaint), so the per-frame overhead is just a comparison
@@ -19,24 +19,12 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, Id};
 /// in `ctx.memory()`. This correctly handles multiple contexts (e.g. in
 /// tests) unlike a global OnceLock would.
 pub fn apply_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = WINDOW_FILL;
-    visuals.panel_fill = PANEL_FILL;
-    visuals.extreme_bg_color = EXTREME_BG;
-    visuals.widgets.noninteractive.bg_fill = WINDOW_FILL;
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 42, 42);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(62, 62, 62);
-    visuals.widgets.active.bg_fill = ACTIVE_BG;
-    visuals.selection.bg_fill = SELECTION_BG;
-    visuals.selection.stroke.color = Color32::from_rgb(255, 255, 255);
-    visuals.override_text_color = Some(TEXT_COLOR);
-    ctx.set_visuals(visuals);
-
-    // Only set fonts once per context to avoid expensive TTF binary comparison
-    // in egui's set_fonts() deduplication check. We use a per-context flag
-    // via ctx.memory() so that each new context gets fonts installed exactly
-    // once (unlike a global OnceLock which would prevent fonts from being set
-    // on any context created after the first one).
+    // Only set visuals and fonts once per context to avoid per-frame Visuals/Style
+    // construction and expensive TTF binary comparison in egui's set_fonts()
+    // deduplication check. We use a per-context flag via ctx.memory() so that
+    // each new context gets theme and fonts installed exactly once (unlike a
+    // global OnceLock which would prevent installation on any context created
+    // after the first one).
     let fonts_installed = ctx
         .memory(|mem| {
             mem.data
@@ -44,6 +32,18 @@ pub fn apply_theme(ctx: &egui::Context) {
         })
         .unwrap_or(false);
     if !fonts_installed {
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_fill = WINDOW_FILL;
+        visuals.panel_fill = PANEL_FILL;
+        visuals.extreme_bg_color = EXTREME_BG;
+        visuals.widgets.noninteractive.bg_fill = WINDOW_FILL;
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 42, 42);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(62, 62, 62);
+        visuals.widgets.active.bg_fill = ACTIVE_BG;
+        visuals.selection.bg_fill = SELECTION_BG;
+        visuals.selection.stroke.color = Color32::from_rgb(255, 255, 255);
+        visuals.override_text_color = Some(TEXT_COLOR);
+        ctx.set_visuals(visuals);
         ctx.set_fonts(fonts().clone());
         ctx.memory_mut(|mem| {
             mem.data
@@ -134,7 +134,7 @@ mod tests {
     fn themed_visuals() -> egui::Visuals {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
-        ctx.style().visuals.clone()
+        ctx.global_style().visuals.clone()
     }
 
     #[test]

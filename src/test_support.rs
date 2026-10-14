@@ -116,6 +116,9 @@ pub(crate) mod ec_syscall_mock {
         pub lseek_errors: Vec<i32>,
         pub closes: Vec<c_int>,
         pub systems: Vec<String>,
+        /// Non-zero values are returned by the next `mock_system` calls.
+        /// An empty queue means success (`0`), matching a clean `system()` exit.
+        pub system_results: Vec<c_int>,
     }
 
     pub(crate) static MOCK_STATE: Mutex<MockState> = Mutex::new(MockState {
@@ -131,6 +134,7 @@ pub(crate) mod ec_syscall_mock {
         lseek_errors: Vec::new(),
         closes: Vec::new(),
         systems: Vec::new(),
+        system_results: Vec::new(),
     });
 
     pub(crate) fn reset_mock_state() {
@@ -241,7 +245,11 @@ pub(crate) mod ec_syscall_mock {
             .into_owned();
         let mut s = MOCK_STATE.lock().unwrap();
         s.systems.push(cmd);
-        0
+        if s.system_results.is_empty() {
+            0
+        } else {
+            s.system_results.remove(0)
+        }
     }
 
     fn install_mock_ops() {

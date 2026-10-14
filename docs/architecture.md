@@ -75,12 +75,16 @@ sequenceDiagram
 
 ### Sequence
 
-1. **Poller** calls `ec.refresh()` via `spawn_blocking` (avoids blocking async runtime)
-2. **Poller** extracts `TelemetrySnapshot` from the EC buffer
-3. **Poller** sends snapshot through `watch::Sender` (latest-value semantics, no queue growth)
+1. **Poller** calls `ec.refresh()` on the blocking pool (`spawn_blocking`), so a slow debugfs read does not stall a Tokio worker
+2. **Poller** copies a `Copy` `TelemetrySnapshot` out of the existing 256-byte EC buffer
+3. **Poller** sends that snapshot through `watch::Sender` (latest-value semantics, no queue growth)
 4. **GUI** checks `watch::Receiver::has_changed()` each frame
 5. **GUI** acquires `AppState` lock and calls `apply_telemetry()`
 6. **GUI** renders from the borrowed state (no clone in steady state)
+
+The winit event loop runs on the main thread after startup `block_on` returns. Hyprland xdg pings are answered there. Glow swap interval is "don't wait". The fan-control page is a vertical scroll area sized to the space under the tab bar, so undervolt and exit remain reachable in a short window.
+
+`nitro-sense` is `pkexec /usr/bin/nitrosense`. After elevation the process restores `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` from the uid in `PKEXEC_UID` or `SUDO_UID`. `ec_open` opens `/sys/kernel/debug/ec/ec0/io` first and does not run `modprobe -r` when that open succeeds.
 
 ### Voltage Polling (parallel)
 

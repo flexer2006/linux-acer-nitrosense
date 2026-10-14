@@ -52,8 +52,17 @@ void ec_set_ops(const struct ec_ops *ops) {
 static const char EC_SYS_PATH[]  = "/sys/kernel/debug/ec/ec0/io";
 static const char EC_DEV_PATH[]  = "/dev/ec";
 
-/* debugfs magic number (DEBUGFS_MAGIC) */
-#define NITRO_DEBUGFS_MAGIC 0x6462672f
+/* linux/magic.h DEBUGFS_MAGIC ("dbg "). Confirmed on this host via
+   statfs(/sys/kernel/debug) == 0x64626720. */
+#define NITRO_DEBUGFS_MAGIC 0x64626720UL
+
+static int run_helper(const char *cmd) {
+    int rc = nitro_hw_ops.system(cmd);
+    if (rc == 0) {
+        return 0;
+    }
+    return -EIO;
+}
 
 /* Ensure debugfs is mounted at /sys/kernel/debug. The ec_sys interface is
    exposed through debugfs, so without it /sys/kernel/debug/ec/ec0/io will
@@ -64,7 +73,7 @@ static int ec_ensure_debugfs(void) {
         (unsigned long)st.f_type == NITRO_DEBUGFS_MAGIC) {
         return 0;
     }
-    return nitro_hw_ops.system("mount -t debugfs none /sys/kernel/debug 2>/dev/null");
+    return run_helper("mount -t debugfs none /sys/kernel/debug 2>/dev/null");
 }
 
 /* ---- High-resolution timing for EC write latency tracing ---- */
@@ -78,9 +87,9 @@ static inline uint64_t nanos_now(void) {
 /* Cache the NITRO_TRACE env var check on first call so we don't call
    getenv() on every EC refresh/write. The value is stable for the
    lifetime of the process (tracing is either on or off at startup). */
-static int nitro_trace_enabled(void) {
+static inline int nitro_trace_enabled(void) {
     static int cached = -1;
-    if (cached < 0) {
+    if (__builtin_expect(cached < 0, 0)) {
         cached = getenv("NITRO_TRACE") != NULL;
     }
     return cached;
@@ -95,36 +104,65 @@ int ec_open(struct ec_handle *out) {
     memset(out, 0, sizeof(*out));
     out->fd = -1;
 
-    /* Try ec_sys first. The ec_sys interface is exposed through debugfs, so
-       make sure debugfs is mounted before attempting the open or modprobe. */
-    (void)ec_ensure_debugfs();
-    (void)nitro_hw_ops.system("modprobe -r ec_sys 2>/dev/null");
-    (void)nitro_hw_ops.system("modprobe ec_sys write_support=y 2>/dev/null");
-
     int fd = nitro_hw_ops.open(EC_SYS_PATH, O_RDWR | O_CLOEXEC);
     if (fd >= 0) {
-        out->fd         = fd;
+        out->fd = fd;
         out->uses_ec_sys = true;
         return 0;
     }
     int ec_sys_errno = errno;
+    int helper_error = 0;
 
-    /* Fallback to acpi_ec */
-    (void)nitro_hw_ops.system("modprobe acpi_ec 2>/dev/null");
+    if (ec_sys_errno == ENOENT) {
+        int prepared = ec_ensure_debugfs();
+        if (prepared != 0) {
+            helper_error = prepared;
+        }
+        int loaded = run_helper("modprobe ec_sys write_support=y 2>/dev/null");
+        if (loaded != 0 && helper_error == 0) {
+            helper_error = loaded;
+        }
+        fd = nitro_hw_ops.open(EC_SYS_PATH, O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            out->fd = fd;
+            out->uses_ec_sys = true;
+            return 0;
+        }
+        ec_sys_errno = errno;
+    }
 
     fd = nitro_hw_ops.open(EC_DEV_PATH, O_RDWR | O_CLOEXEC);
     if (fd >= 0) {
-        out->fd         = fd;
+        out->fd = fd;
         out->uses_ec_sys = false;
         return 0;
     }
+    int acpi_errno = errno;
 
-    /* Preserve the most informative error: EACCES (missing write_support)
-       is more actionable than ENOENT (path simply missing). */
-    if (ec_sys_errno == EACCES || errno == EACCES) {
+    if (acpi_errno == ENOENT) {
+        int loaded = run_helper("modprobe acpi_ec 2>/dev/null");
+        if (loaded != 0 && helper_error == 0) {
+            helper_error = loaded;
+        }
+        fd = nitro_hw_ops.open(EC_DEV_PATH, O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            out->fd = fd;
+            out->uses_ec_sys = false;
+            return 0;
+        }
+        acpi_errno = errno;
+    }
+
+    if (ec_sys_errno == EACCES || acpi_errno == EACCES) {
         return -EACCES;
     }
-    return -errno;
+    if (helper_error != 0) {
+        return helper_error;
+    }
+    if (acpi_errno != 0) {
+        return -acpi_errno;
+    }
+    return -ec_sys_errno;
 }
 
 void ec_close(struct ec_handle *h) {
@@ -138,13 +176,13 @@ void ec_close(struct ec_handle *h) {
     h->fd = -1;
 }
 
-int ec_refresh(struct ec_handle *h, uint8_t *buffer, size_t len) {
+int ec_refresh(struct ec_handle *restrict h, uint8_t *restrict buffer, size_t len) {
     if (!h || h->fd < 0 || !buffer || len == 0) {
         return -EINVAL;
     }
 
     int tracing = nitro_trace_enabled();
-    uint64_t t0 = tracing ? nanos_now() : 0;
+    uint64_t t0 = __builtin_expect(tracing, 0) ? nanos_now() : 0;
 
     if (nitro_hw_ops.lseek(h->fd, 0, SEEK_SET) == (off_t)-1) {
         return -errno;
@@ -155,7 +193,7 @@ int ec_refresh(struct ec_handle *h, uint8_t *buffer, size_t len) {
         return -errno;
     }
 
-    if (tracing) {
+    if (__builtin_expect(tracing, 0)) {
         uint64_t dt_ns = nanos_now() - t0;
         fprintf(stderr, "TRACE ec_refresh bytes=%zd latency=%lu_ns\n",
                 n, (unsigned long)dt_ns);
@@ -164,13 +202,13 @@ int ec_refresh(struct ec_handle *h, uint8_t *buffer, size_t len) {
     return (int)n;
 }
 
-int ec_write_byte(struct ec_handle *h, uint8_t addr, uint8_t val) {
+int ec_write_byte(struct ec_handle *restrict h, uint8_t addr, uint8_t val) {
     if (!h || h->fd < 0) {
         return -EINVAL;
     }
 
     int tracing = nitro_trace_enabled();
-    uint64_t t0 = tracing ? nanos_now() : 0;
+    uint64_t t0 = __builtin_expect(tracing, 0) ? nanos_now() : 0;
 
     if (nitro_hw_ops.lseek(h->fd, (off_t)addr, SEEK_SET) == (off_t)-1) {
         return -errno;
@@ -184,7 +222,7 @@ int ec_write_byte(struct ec_handle *h, uint8_t addr, uint8_t val) {
         return -EIO;
     }
 
-    if (tracing) {
+    if (__builtin_expect(tracing, 0)) {
         uint64_t dt_ns = nanos_now() - t0;
         fprintf(stderr, "TRACE ec_write_byte addr=0x%02X val=0x%02X latency=%lu_ns\n",
                 addr, val, (unsigned long)dt_ns);

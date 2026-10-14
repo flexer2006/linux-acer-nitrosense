@@ -9,7 +9,7 @@ use crate::error::NitroError;
 use crate::hardware::ec::{Ec, EcDevice};
 use tokio::sync::{Mutex, watch};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TelemetrySnapshot {
     pub cpu_temp: u8,
     pub gpu_temp: u8,
@@ -90,6 +90,9 @@ where
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Blocking EC I/O stays off the async worker. A stalled
+                // worker inside the same runtime as the window stops Hyprland
+                // ping replies and the compositor shows "not responding".
                 let snapshot = poll_once(Arc::clone(&ec)).await?;
                 if tx.send(snapshot).is_err() {
                     return Ok(());
@@ -245,7 +248,7 @@ mod tests {
             timestamp: Instant::now(),
         };
 
-        let cloned = original.clone();
+        let cloned = original;
 
         assert_eq!(cloned.cpu_temp, original.cpu_temp);
         assert_eq!(cloned.gpu_temp, original.gpu_temp);
@@ -339,7 +342,7 @@ mod tests {
             changed.is_ok(),
             "poller should publish a snapshot within 1 second"
         );
-        let snap = telemetry_rx.borrow_and_update().clone();
+        let snap = *telemetry_rx.borrow_and_update();
         assert_eq!(
             snap.cpu_temp, 88,
             "poller must propagate the CPU temp from the EC buffer"

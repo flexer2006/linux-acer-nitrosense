@@ -37,7 +37,7 @@ pub fn render(ui: &mut Ui, state: &AppState, command_tx: &Sender<Command>) {
     // CPU Fan Controls
     render_fan_section(
         ui,
-        "CPU Fan",
+        "CPU Fan:",
         state.cpu_fan_mode,
         state.cpu_manual_speed,
         true,
@@ -49,7 +49,7 @@ pub fn render(ui: &mut Ui, state: &AppState, command_tx: &Sender<Command>) {
     // GPU Fan Controls
     render_fan_section(
         ui,
-        "GPU Fan",
+        "GPU Fan:",
         state.gpu_fan_mode,
         state.gpu_manual_speed,
         false,
@@ -66,10 +66,7 @@ fn render_fan_section(
     command_tx: &Sender<Command>,
 ) {
     ui.group(|ui| {
-        // Stack-allocated label formatting avoids per-frame String allocation
-        let mut label_buf = FmtBuf::<32>::new();
-        let _ = write!(label_buf, "{}:", label);
-        ui.label(label_buf.as_str());
+        ui.label(label);
 
         // Mode selection
         ui.horizontal(|ui| {
